@@ -51,7 +51,7 @@ DEVICE_LVM=""
 LUKS_DEVICE_NAME="cryptroot"
 LVM_VOLUME_GROUP="vg"
 LVM_VOLUME_LOGICAL="root"
-SWAPFILE="/swapfile"
+SWAPFILE=""
 BOOT_DIRECTORY=""
 ESP_DIRECTORY=""
 #PARTITION_BOOT_NUMBER=0
@@ -160,7 +160,7 @@ function check_variables() {
     check_variables_value "HOOKS" "$HOOKS"
     check_variables_list "BOOTLOADER" "$BOOTLOADER" "grub refind systemd"
     check_variables_list "AUR" "$AUR" "aurman yay" "false"
-    check_variables_list "DESKTOP_ENVIRONMENT" "$DESKTOP_ENVIRONMENT" "gnome kde xfce mate cinnamon lxde" "false"
+    check_variables_list "DESKTOP_ENVIRONMENT" "$DESKTOP_ENVIRONMENT" "i3 gnome kde xfce mate cinnamon lxde" "false"
     check_variables_list "DISPLAY_DRIVER" "$DISPLAY_DRIVER" "intel amdgpu ati nvidia nvidia-lts nvidia-dkms nvidia-390xx nvidia-390xx-lts nvidia-390xx-dkms nouveau" "false"
     check_variables_boolean "KMS" "$KMS"
     check_variables_boolean "DISPLAY_DRIVER_DDX" "$DISPLAY_DRIVER_DDX"
@@ -328,7 +328,18 @@ function prepare_partition() {
 
 function configure_network() {
     if [ -n "$WIFI_INTERFACE" ]; then
-        iwctl --passphrase "$WIFI_KEY" station $WIFI_INTERFACE connect $WIFI_ESSID
+        cp /etc/netctl/examples/wireless-wpa /etc/netctl
+        chmod 600 /etc/netctl/wireless-wpa
+
+        sed -i 's/^Interface=.*/Interface='"$WIFI_INTERFACE"'/' /etc/netctl/wireless-wpa
+        sed -i 's/^ESSID=.*/ESSID='"$WIFI_ESSID"'/' /etc/netctl/wireless-wpa
+        sed -i 's/^Key=.*/Key='"$WIFI_KEY"'/' /etc/netctl/wireless-wpa
+        if [ "$WIFI_HIDDEN" == "true" ]; then
+            sed -i 's/^#Hidden=.*/Hidden=yes/' /etc/netctl/wireless-wpa
+        fi
+
+        netctl stop-all
+        netctl start wireless-wpa
         sleep 10
     fi
 
@@ -345,7 +356,7 @@ function partition() {
 
     # setup
     if [ "$PARTITION_MODE" == "auto" ]; then
-        PARTITION_PARTED_UEFI="mklabel gpt mkpart ESP fat32 1MiB 512MiB mkpart root $FILE_SYSTEM_TYPE 512MiB 100% set 1 esp on"
+        PARTITION_PARTED_UEFI="mklabel gpt mkpart primary fat32 1MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
         PARTITION_PARTED_BIOS="mklabel msdos mkpart primary ext4 4MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
 
         if [ "$BIOS_TYPE" == "uefi" ]; then
@@ -420,6 +431,8 @@ function partition() {
     if [ "$PARTITION_MODE" == "auto" -o "$PARTITION_MODE" == "custom" ]; then
         if [ "$BIOS_TYPE" == "uefi" ]; then
             parted -s $DEVICE $PARTITION_PARTED_UEFI
+
+            sgdisk -t=$PARTITION_BOOT_NUMBER:ef00 $DEVICE
             if [ -n "$LUKS_PASSWORD" ]; then
                 sgdisk -t=$PARTITION_ROOT_NUMBER:8309 $DEVICE
             elif [ "$LVM" == "true" ]; then
@@ -479,7 +492,7 @@ function partition() {
         if [ "$FILE_SYSTEM_TYPE" == "f2fs" ]; then
             PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime,nodiscard"
         else
-            PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime"
+            PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime,discard"
         fi
     fi
 
@@ -507,16 +520,13 @@ function partition() {
     fi
 
     # swap
-    if [ -n "$SWAP_SIZE" ]; then
-        if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
-            truncate -s 0 /mnt$SWAPFILE
-            chattr +C /mnt$SWAPFILE
-            btrfs property set /mnt$SWAPFILE compression none
-        fi
-
-        dd if=/dev/zero of=/mnt$SWAPFILE bs=1M count=$SWAP_SIZE status=progress
-        chmod 600 /mnt$SWAPFILE
-        mkswap /mnt$SWAPFILE
+    # btrfs: https://btrfs.wiki.kernel.org/index.php/FAQ#Does_btrfs_support_swap_files.3F
+    # btrfs: https://wiki.archlinux.org/index.php/Btrfs#Disabling_CoW
+    # btrfs: https://jlk.fjfi.cvut.cz/arch/manpages/man/btrfs.5#MOUNT_OPTIONS
+    if [ -n "$SWAP_SIZE" -a "$FILE_SYSTEM_TYPE" != "btrfs" ]; then
+        fallocate -l $SWAP_SIZE "/mnt/swapfile"
+        chmod 600 "/mnt/swapfile"
+        mkswap "/mnt/swapfile"
     fi
 
     # set variables
@@ -557,9 +567,9 @@ function configuration() {
 
     genfstab -U /mnt >> /mnt/etc/fstab
 
-    if [ -n "$SWAP_SIZE" ]; then
+    if [ -n "$SWAP_SIZE" -a "$FILE_SYSTEM_TYPE" != "btrfs" ]; then
         echo "# swap" >> /mnt/etc/fstab
-        echo "$SWAPFILE none swap defaults 0 0" >> /mnt/etc/fstab
+        echo "/swapfile none swap defaults 0 0" >> /mnt/etc/fstab
         echo "" >> /mnt/etc/fstab
     fi
 
@@ -567,7 +577,7 @@ function configuration() {
         if [ "$FILE_SYSTEM_TYPE" == "f2fs" ]; then
             sed -i 's/relatime/noatime,nodiscard/' /mnt/etc/fstab
         else
-            sed -i 's/relatime/noatime/' /mnt/etc/fstab
+            sed -i 's/relatime/noatime,discard/' /mnt/etc/fstab
         fi
         arch-chroot /mnt systemctl enable fstrim.timer
     fi
@@ -587,29 +597,19 @@ function configuration() {
     echo -e "$KEYMAP\n$FONT\n$FONT_MAP" > /mnt/etc/vconsole.conf
     echo $HOSTNAME > /mnt/etc/hostname
 
-    OPTIONS=""
-    if [ -n "$KEYLAYOUT" ]; then
-        OPTIONS="$OPTIONS"$'\n'"    Option \"XkbLayout\" \"$KEYLAYOUT\""
-    fi
-    if [ -n "$KEYMODEL" ]; then
-        OPTIONS="$OPTIONS"$'\n'"    Option \"XkbModel\" \"$KEYMODEL\""
-    fi
-    if [ -n "$KEYVARIANT" ]; then
-        OPTIONS="$OPTIONS"$'\n'"    Option \"XkbVariant\" \"$KEYVARIANT\""
-    fi
-    if [ -n "$KEYOPTIONS" ]; then
-        OPTIONS="$OPTIONS"$'\n'"    Option \"XkbOptions\" \"$KEYOPTIONS\""
-    fi
-
     arch-chroot /mnt mkdir -p "/etc/X11/xorg.conf.d/"
     cat <<EOT > /mnt/etc/X11/xorg.conf.d/00-keyboard.conf
 # Written by systemd-localed(8), read by systemd-localed and Xorg. It's
 # probably wise not to edit this file manually. Use localectl(1) to
 # instruct systemd-localed to update it.
 Section "InputClass"
-    Identifier "system-keyboard"
+    Identifier "all keyboards"
     MatchIsKeyboard "on"
-    $OPTIONS
+    Driver "libinput"
+    Option "XkbModel" "latitude"
+    Option "XkbLayout" "$KEYLAYOUT"
+    Option "XkbVariant" ",winkeys"
+    Option "XkbOptions" "grp:win_space_toggle, grp_led:scroll"
 EndSection
 EOT
 
@@ -643,6 +643,7 @@ function mkinitcpio_configuration() {
                 ;;
         esac
         arch-chroot /mnt sed -i "s/^MODULES=()/MODULES=($MODULES)/" /etc/mkinitcpio.conf
+        arch-chroot /mnt echo "options i915 fastboot=1" > /etc/mkinitcpio.d/i915.conf
     fi
 
     if [ "$LVM" == "true" ]; then
@@ -811,7 +812,9 @@ function create_user_homectl() {
     ### after install and reboot this commands work
     systemctl start systemd-homed.service
     set +e
-    homectl create "$USER_NAME" --enforce-password-policy=no --timezone=$TZ --language=$L $STORAGE $CIFS_DOMAIN $CIFS_USERNAME $CIFS_SERVICE -G wheel,storage,optical
+    groupadd -g 34 -o backup
+    groupadd -r autologin
+    homectl create "$USER_NAME" --enforce-password-policy=no --timezone=$TZ --language=$L $STORAGE $CIFS_DOMAIN $CIFS_USERNAME $CIFS_SERVICE -G wheel,storage,optical,backup,autologin
     homectl activate "$USER_NAME"
     set -e
     cp -a "$IMAGE_PATH/." "/mnt$IMAGE_PATH"
@@ -822,7 +825,9 @@ function create_user_homectl() {
 function create_user_useradd() {
     USER_NAME=$1
     USER_PASSWORD=$2
-    arch-chroot /mnt useradd -m -G wheel,storage,optical -s /bin/bash $USER_NAME
+    arch-chroot /mnt groupadd -g 34 -o backup
+    arch-chroot /mnt groupadd -r autologin
+    arch-chroot /mnt useradd -m -G wheel,storage,optical,backup,autologin -s /bin/bash $USER_NAME
     printf "$USER_PASSWORD\n$USER_PASSWORD" | arch-chroot /mnt passwd $USER_NAME
 }
 
@@ -1253,6 +1258,10 @@ function desktop_environment() {
         "lxde" )
             desktop_environment_lxde
             ;;
+        "i3" )
+            desktop_environment_i3
+            ;;
+
     esac
 
     arch-chroot /mnt systemctl set-default graphical.target
@@ -1288,6 +1297,11 @@ function desktop_environment_lxde() {
     arch-chroot /mnt systemctl enable lxdm.service
 }
 
+function desktop_environment_i3() {
+    pacman_install "i3 lightdm lightdm-gtk-greeter xorg-server"
+    arch-chroot /mnt systemctl enable lightdm.service
+}
+
 function packages() {
     print_step "packages()"
 
@@ -1296,11 +1310,11 @@ function packages() {
     fi
 
     if [ -n "$AUR" -o -n "$PACKAGES_AUR" ]; then
-        packages_aur
+        package_aur
     fi
 }
 
-function packages_aur() {
+function package_aur() {
     arch-chroot /mnt sed -i 's/%wheel ALL=(ALL) ALL/%wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers
 
     if [ -n "$AUR" -o -n "$PACKAGES_AUR" ]; then
@@ -1397,6 +1411,7 @@ function end() {
     fi
 }
 
+}
 function pacman_install() {
     set +e
     IFS=' ' PACKAGES=($1)
@@ -1415,14 +1430,14 @@ function pacman_install() {
 function aur_install() {
     set +e
     IFS=' ' PACKAGES=($1)
-    AUR_COMMAND="$AUR -Syu --noconfirm --needed ${PACKAGES[@]}"
     for VARIABLE in {1..5}
     do
-        arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -c \"$AUR_COMMAND\""
+#        arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | sudo -u $USER_NAME -S $AUR -Syu --noconfirm --needed ${PACKAGES[@]}"
+        arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -c \"$AUR -Syu --noconfirm --needed ${PACKAGES[@]}\""
         if [ $? == 0 ]; then
             break
         else
-            sleep 10
+            sleep 3
         fi
     done
     set -e
